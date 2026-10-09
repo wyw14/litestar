@@ -130,14 +130,30 @@ class ASGIResponse:
         """
         return [*self.headers.headers, *self._encoded_cookies]
 
-    async def after_response(self) -> None:
+    async def after_response(self, scope: Scope, receive: Receive) -> None:
         """Execute after the response is sent.
+
+        The background tasks are handed off to the per-request
+        :class:`BackgroundTaskManager <.background_tasks.BackgroundTaskManager>`,
+        which routes task exceptions into the application error channel instead of
+        modifying the already completed response.
+
+        Args:
+            scope: The ASGI connection scope.
+            receive: The ASGI receive function, used to listen for client disconnects.
 
         Returns:
             None
         """
-        if self.background is not None:
-            await self.background()
+        if self.background is None:
+            return
+        from litestar.background_tasks import BackgroundTaskManager
+
+        manager = BackgroundTaskManager.from_scope(scope)
+        # copy the tasks into the manager's own per-request state, so a shared
+        # response / task container cannot leak state across requests
+        manager.add(self.background)
+        await manager(scope=scope, receive=receive)
 
     async def start_response(self, send: Send) -> None:
         """Emit the start event of the response. This event includes the headers and status codes.
@@ -190,7 +206,7 @@ class ASGIResponse:
         else:
             await self.send_body(send=send, receive=receive)
 
-        await self.after_response()
+        await self.after_response(scope=scope, receive=receive)
 
 
 class Response(Generic[T]):

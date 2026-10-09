@@ -8,6 +8,7 @@ from litestar.types import Empty, EmptyType
 if TYPE_CHECKING:
     from typing import Self
 
+    from litestar.background_tasks import BackgroundTaskManager
     from litestar.datastructures import URL, Accept, Headers, UploadFile
     from litestar.types.asgi_types import Scope
     from litestar.types.composite_types import ExceptionHandlersMap
@@ -27,6 +28,7 @@ class ScopeState:
     __slots__ = (
         "_compat_ns",
         "accept",
+        "background_task_manager",
         "base_url",
         "body",
         "content_type",
@@ -51,6 +53,7 @@ class ScopeState:
 
     def __init__(self) -> None:
         self.accept = Empty
+        self.background_task_manager = Empty
         self.base_url = Empty
         self.body = Empty
         self.content_type = Empty
@@ -73,6 +76,7 @@ class ScopeState:
         self.url = Empty
 
     accept: Accept | EmptyType
+    background_task_manager: BackgroundTaskManager | EmptyType
     base_url: URL | EmptyType
     body: bytes | EmptyType
     content_type: tuple[str, dict[str, str]] | EmptyType
@@ -91,7 +95,7 @@ class ScopeState:
     parsed_query: tuple[tuple[str, str], ...] | EmptyType
     response_compressed: bool | EmptyType
     response_started: bool
-    session_id: str | None | EmptyType
+    session_id: str | EmptyType | None
     url: URL | EmptyType
 
     @classmethod

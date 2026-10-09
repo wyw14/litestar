@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypedDict, cast
 from uuid import UUID
 
+import anyio
+
 from litestar._asgi import ASGIRouter
 from litestar._asgi.utils import get_route_handlers, wrap_in_exception_handler
 from litestar._openapi.plugin import OpenAPIPlugin
@@ -59,6 +61,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable, Generator, Iterable, Mapping, Sequence
     from typing import Self
 
+    from litestar.background_tasks import BackgroundTaskManager
     from litestar.config.compression import CompressionConfig
     from litestar.config.cors import CORSConfig
     from litestar.config.csrf import CSRFConfig
@@ -134,6 +137,8 @@ class Litestar(Router):
     """
 
     __slots__ = (
+        "_background_task_managers",
+        "_background_tasks_shutdown_event",
         "_debug",
         "_is_using_litestar_test_client",
         "_lifespan_managers",
@@ -392,6 +397,11 @@ class Litestar(Router):
 
         self._openapi_schema: OpenAPI | None = None
         self._debug: bool = True
+        # per-request background task managers that are currently active; the
+        # registry itself only tracks liveness - all task state lives in the
+        # manager bound to the respective request's scope
+        self._background_task_managers: set[BackgroundTaskManager] = set()
+        self._background_tasks_shutdown_event: anyio.Event | None = None
         self.stores: StoreRegistry = (
             config.stores if isinstance(config.stores, StoreRegistry) else StoreRegistry(config.stores)
         )
@@ -592,8 +602,8 @@ class Litestar(Router):
 
         It will be entered when the ``lifespan`` message has been received from the
         server, and exit after the ``asgi.shutdown`` message. During this period, it is
-        responsible for calling the ``on_startup``, ``on_shutdown`` hooks, as well as
-        custom lifespan managers.
+        responsible for calling the ``on_startup``, ``on_shutdown`` hooks, as well
+        as custom lifespan managers.
         """
         async with AsyncExitStack() as exit_stack:
             for hook in self.on_shutdown[::-1]:
@@ -609,7 +619,53 @@ class Litestar(Router):
             for hook in self.on_startup:
                 await self._call_lifespan_hook(hook)
 
+            self._background_tasks_shutdown_event = anyio.Event()
+            # pushed last, so it is called first on shutdown: in-flight background
+            # tasks are cancelled with the shutdown reason before any lifespan
+            # resource (stores, event emitter, ...) is torn down
+            exit_stack.push_async_callback(self._shutdown_background_tasks)
+
             yield
+
+    def register_background_task_manager(self, manager: BackgroundTaskManager) -> None:
+        """Track an active per-request background task manager.
+
+        Args:
+            manager: The manager that started processing a request's background tasks.
+        """
+        self._background_task_managers.add(manager)
+
+    def unregister_background_task_manager(self, manager: BackgroundTaskManager) -> None:
+        """Stop tracking a background task manager that has finished processing a request.
+
+        Args:
+            manager: The manager to remove from the active set.
+        """
+        self._background_task_managers.discard(manager)
+
+    def get_background_tasks_shutdown_event(self) -> anyio.Event | None:
+        """Return the lifespan shutdown event watched by background task managers.
+
+        Returns:
+            An :class:`anyio.Event` set on application shutdown, or ``None`` if the
+            application lifespan is not currently running.
+        """
+        return self._background_tasks_shutdown_event
+
+    async def _shutdown_background_tasks(self) -> None:
+        """Cancel still running background tasks with the shutdown reason and wait for
+        their managers to finish cleaning up.
+        """
+        shutdown_event = self._background_tasks_shutdown_event
+        if shutdown_event is not None:
+            shutdown_event.set()
+
+        if self._background_task_managers:
+            async with anyio.create_task_group() as task_group:
+                for manager in tuple(self._background_task_managers):
+                    task_group.start_soon(manager.wait_closed)
+
+        self._background_tasks_shutdown_event = None
 
     @property
     def openapi_schema(self) -> OpenAPI:
