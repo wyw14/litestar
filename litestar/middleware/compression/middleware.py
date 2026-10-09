@@ -113,8 +113,20 @@ class CompressionMiddleware(AbstractMiddleware):
 
         initial_message: HTTPResponseStartEvent | None = None
         started = False
+        # ``compression_active`` tracks whether the response is actually being compressed.
+        # It stays ``False`` if compression was skipped (e.g. for a small response),
+        # ensuring no stale compressor state or content-length is reused afterwards.
+        compression_active = False
 
         connection_state = ScopeState.from_scope(scope)
+
+        def close_facade() -> None:
+            # close the facade, never letting a failure during cleanup mask the
+            # original exception (or propagate after a successful response).
+            try:
+                facade.close()
+            except Exception:  # noqa: BLE001
+                pass
 
         async def send_wrapper(message: Message) -> None:
             """Handle and compresses the HTTP Message with brotli.
@@ -124,19 +136,29 @@ class CompressionMiddleware(AbstractMiddleware):
             """
             nonlocal started
             nonlocal initial_message
+            nonlocal compression_active
 
             if message["type"] == "http.response.start":
                 initial_message = message
                 return
 
             if initial_message is not None and value_or_default(connection_state.is_cached, False):
+                # Cached responses are already fully encoded and are passed through
+                # without compression. The initial message must only ever be sent once,
+                # regardless of how many body messages the cached response consists of.
+                close_facade()
                 await send(initial_message)
+                initial_message = None
                 await send(message)
-                facade.close()
+                return
+
+            if initial_message is None and value_or_default(connection_state.is_cached, False):
+                # subsequent messages of a cached, multi-message response
+                await send(message)
                 return
 
             if initial_message and message["type"] == "http.disconnect":
-                facade.close()
+                close_facade()
                 return
 
             if initial_message and message["type"] == "http.response.body":
@@ -150,45 +172,78 @@ class CompressionMiddleware(AbstractMiddleware):
                         headers["Content-Encoding"] = compression_encoding
                         headers.extend_header_value("vary", "Accept-Encoding")
                         del headers["Content-Length"]
+
+                        try:
+                            facade.write(body, final=not more_body)
+                            compressed_body = bytes_buffer.getvalue()
+                            bytes_buffer.seek(0)
+                            bytes_buffer.truncate()
+                        except BaseException:
+                            # the response has not been started, so the error can
+                            # still be reported as a regular error response.
+                            close_facade()
+                            raise
+
+                        compression_active = True
                         connection_state.response_compressed = True
 
-                        facade.write(body, final=not more_body)
-
-                        message["body"] = bytes_buffer.getvalue()
-                        bytes_buffer.seek(0)
-                        bytes_buffer.truncate()
+                        message["body"] = compressed_body
                         await send(initial_message)
                         await send(message)
 
                     elif len(body) >= self.config.minimum_size:
-                        facade.write(body, final=not more_body)
-                        facade.close()
-                        body = bytes_buffer.getvalue()
+                        try:
+                            facade.write(body, final=not more_body)
+                            facade.close()
+                            compressed_body = bytes_buffer.getvalue()
+                        except BaseException:
+                            # compression failed before the response started -
+                            # report the error instead of sending a corrupt body.
+                            close_facade()
+                            raise
 
                         headers = MutableScopeHeaders(initial_message)
                         headers["Content-Encoding"] = compression_encoding
-                        headers["Content-Length"] = str(len(body))
+                        headers["Content-Length"] = str(len(compressed_body))
                         headers.extend_header_value("vary", "Accept-Encoding")
-                        message["body"] = body
+                        message["body"] = compressed_body
+                        compression_active = True
                         connection_state.response_compressed = True
 
                         await send(initial_message)
                         await send(message)
 
                     else:
-                        facade.close()
+                        # body is too small to compress - keep the original body and
+                        # content-length untouched.
+                        close_facade()
                         await send(initial_message)
                         await send(message)
 
+                elif not compression_active:
+                    # compression was declined for this response, so any further
+                    # messages must be passed through uncompressed to stay
+                    # consistent with the response start already sent.
+                    await send(message)
+
                 else:
-                    facade.write(body, final=not more_body)
-                    if not more_body:
-                        facade.close()
+                    try:
+                        facade.write(body, final=not more_body)
+                        if not more_body:
+                            facade.close()
 
-                    message["body"] = bytes_buffer.getvalue()
+                        compressed_body = bytes_buffer.getvalue()
 
-                    bytes_buffer.seek(0)
-                    bytes_buffer.truncate()
+                        bytes_buffer.seek(0)
+                        bytes_buffer.truncate()
+                    except BaseException:
+                        # report the compressor failure explicitly, before the
+                        # response is considered finished.
+                        close_facade()
+                        bytes_buffer.close()
+                        raise
+
+                    message["body"] = compressed_body
 
                     if not more_body:
                         bytes_buffer.close()

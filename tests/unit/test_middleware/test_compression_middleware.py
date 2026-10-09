@@ -1,5 +1,6 @@
 # pyright: reportUnnecessaryTypeIgnoreComment=false
 
+import gzip
 import sys
 import zlib
 from collections.abc import AsyncIterator, Callable
@@ -11,6 +12,7 @@ import pytest
 
 from litestar import MediaType, WebSocket, get, websocket
 from litestar.config.compression import CompressionConfig
+from litestar.datastructures import Headers
 from litestar.enums import CompressionEncoding
 from litestar.exceptions import ImproperlyConfiguredException
 from litestar.handlers import HTTPRouteHandler
@@ -321,3 +323,155 @@ def test_compression_with_custom_middleware(handler: HTTPRouteHandler) -> None:
         assert response.headers["Content-Encoding"] == "gzip"
         assert int(response.headers["Content-Length"]) < 40000
         mock.assert_called_once()
+
+
+async def test_compressed_content_length_matches_actual_body(
+    create_scope: Callable[..., Scope],
+    mock_asgi_app: ASGIApp,
+) -> None:
+    emitted: list[Message] = []
+
+    async def fake_send(message: Message) -> None:
+        emitted.append(message)
+
+    raw_body = b"_litestar_" * 4000
+    wrapped_send = CompressionMiddleware(
+        mock_asgi_app, CompressionConfig(backend="gzip")
+    ).create_compression_send_wrapper(fake_send, CompressionEncoding.GZIP, create_scope())
+
+    await wrapped_send(
+        HTTPResponseStartEvent(type="http.response.start", status=200, headers=[(b"content-length", b"40000")])
+    )
+    await wrapped_send(HTTPResponseBodyEvent(type="http.response.body", body=raw_body, more_body=False))
+
+    start_message, body_message = emitted
+    headers = Headers(start_message["headers"])
+    # the declared length must match the bytes actually put on the wire
+    assert int(headers["Content-Length"]) == len(body_message["body"])
+    assert gzip.decompress(body_message["body"]) == raw_body
+
+
+async def test_streaming_compression_drops_content_length_and_frames_are_decodable(
+    create_scope: Callable[..., Scope],
+    mock_asgi_app: ASGIApp,
+) -> None:
+    emitted: list[Message] = []
+
+    async def fake_send(message: Message) -> None:
+        emitted.append(message)
+
+    wrapped_send = CompressionMiddleware(
+        mock_asgi_app, CompressionConfig(backend="gzip")
+    ).create_compression_send_wrapper(fake_send, CompressionEncoding.GZIP, create_scope())
+
+    await wrapped_send(
+        HTTPResponseStartEvent(type="http.response.start", status=200, headers=[(b"content-length", b"40000")])
+    )
+    chunks = [b"_litestar_" * 200, b"_litestar_" * 200]
+    await wrapped_send(HTTPResponseBodyEvent(type="http.response.body", body=chunks[0], more_body=True))
+    await wrapped_send(HTTPResponseBodyEvent(type="http.response.body", body=chunks[1], more_body=True))
+    await wrapped_send(HTTPResponseBodyEvent(type="http.response.body", body=b"", more_body=False))
+
+    start_message = emitted[0]
+    headers = Headers(start_message["headers"])
+    assert "Content-Length" not in headers
+    assert headers["Content-Encoding"] == CompressionEncoding.GZIP
+    # joining all the emitted frames must yield the complete, decodable payload
+    assert gzip.decompress(b"".join(m["body"] for m in emitted[1:])) == b"_litestar_" * 400
+
+
+def test_cached_streaming_response_replays_single_start() -> None:
+    async def iterator() -> AsyncIterator[bytes]:
+        for _ in range(3):
+            yield b"_litestar_" * 400
+
+    @get("/", cache=True, sync_to_thread=False)
+    def handler_fn() -> Stream:
+        return Stream(iterator())
+
+    with create_test_client(
+        route_handlers=[handler_fn], compression_config=CompressionConfig(backend="gzip")
+    ) as client:
+        first = client.get("/", headers={"Accept-Encoding": "gzip"})
+        second = client.get("/", headers={"Accept-Encoding": "gzip"})
+
+    assert first.status_code == HTTP_200_OK
+    assert first.text == "_litestar_" * 1200
+    assert second.status_code == HTTP_200_OK
+    assert second.text == "_litestar_" * 1200
+    assert second.headers["Content-Encoding"] == CompressionEncoding.GZIP
+
+
+class _RaisingCompression(CompressionFacade):
+    encoding = "x-raise"
+
+    def __init__(
+        self, buffer: BytesIO, compression_encoding: str, config: CompressionConfig
+    ) -> None:
+        self.buffer = buffer
+
+    def write(self, body: Union[bytes, bytearray], final: bool = False) -> None:
+        raise RuntimeError("compressor exploded")
+
+    def close(self) -> None: ...
+
+
+async def test_compressor_exception_before_start_is_raised(
+    create_scope: Callable[..., Scope],
+    mock_asgi_app: ASGIApp,
+) -> None:
+    emitted: list[Message] = []
+
+    async def fake_send(message: Message) -> None:
+        emitted.append(message)
+
+    config = CompressionConfig(
+        backend="x-raise", compression_facade=_RaisingCompression, gzip_fallback=False
+    )
+    wrapped_send = CompressionMiddleware(mock_asgi_app, config).create_compression_send_wrapper(
+        fake_send, "x-raise", create_scope()
+    )
+
+    await wrapped_send(HTTPResponseStartEvent(type="http.response.start", status=200, headers=[]))
+    # a failure on the first (uncompressed) message must surface before the
+    # response starts, and nothing must have been sent
+    with pytest.raises(RuntimeError, match="compressor exploded"):
+        await wrapped_send(
+            HTTPResponseBodyEvent(type="http.response.body", body=b"_litestar_" * 4000, more_body=False)
+        )
+    assert emitted == []
+
+
+def test_compressor_exception_single_shot_returns_error_response(handler: HTTPRouteHandler) -> None:
+    config = CompressionConfig(
+        backend="x-raise", compression_facade=_RaisingCompression, gzip_fallback=False
+    )
+    with create_test_client([handler], compression_config=config, raise_server_exceptions=False) as client:
+        response = client.get("/", headers={"Accept-Encoding": "x-raise"})
+    assert response.status_code == 500
+    assert "Content-Encoding" not in response.headers
+
+
+async def test_further_messages_pass_through_when_compression_skipped(
+    create_scope: Callable[..., Scope],
+    mock_asgi_app: ASGIApp,
+) -> None:
+    emitted: list[Message] = []
+
+    async def fake_send(message: Message) -> None:
+        emitted.append(message)
+
+    wrapped_send = CompressionMiddleware(
+        mock_asgi_app, CompressionConfig(backend="gzip")
+    ).create_compression_send_wrapper(fake_send, CompressionEncoding.GZIP, create_scope())
+
+    await wrapped_send(
+        HTTPResponseStartEvent(type="http.response.start", status=200, headers=[(b"content-length", b"10")])
+    )
+    # first, uncompressed (below minimum size) message - declares the response
+    await wrapped_send(HTTPResponseBodyEvent(type="http.response.body", body=b"_litestar_", more_body=False))
+    # any further message must not touch the compressor and stay uncompressed
+    await wrapped_send(HTTPResponseBodyEvent(type="http.response.body", body=b"more", more_body=False))
+
+    assert emitted[1]["body"] == b"_litestar_"
+    assert emitted[2]["body"] == b"more"
