@@ -740,6 +740,15 @@ class HTTPRouteHandler(BaseRouteHandler):
                     if kwargs.get("data") is Empty:
                         del kwargs["data"]
 
+                    # validate every client-provided input - for the handler and
+                    # all its dependency providers - before any dependency is
+                    # resolved, the handler is called or background tasks run
+                    parameter_model.validate_kwargs(
+                        connection=request,
+                        kwargs=kwargs,
+                        handler_signature_model=self.signature_model,
+                    )
+
                     if parameter_model.dependency_batches:
                         cleanup_group = await parameter_model.resolve_dependencies(request, kwargs)
                         await stack.enter_async_context(cleanup_group)

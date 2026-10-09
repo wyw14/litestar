@@ -45,6 +45,7 @@ __all__ = ("KwargsModel",)
 if TYPE_CHECKING:
     from litestar._kwargs.types import Extractor
     from litestar._signature import SignatureModel
+    from litestar._signature.model import ErrorMessage
     from litestar.connection import ASGIConnection
     from litestar.di import Provide
     from litestar.dto import AbstractDTO
@@ -77,6 +78,7 @@ class KwargsModel:
 
     __slots__ = (
         "dependency_batches",
+        "dependency_signature_models",
         "expected_cookie_params",
         "expected_data_dto",
         "expected_form_data",
@@ -146,6 +148,21 @@ class KwargsModel:
         self.is_data_optional = is_data_optional
         self.extractors: list[Extractor] = self._create_extractors()
         self.dependency_batches = create_dependency_batches(expected_dependencies)
+
+        # signature models of all dependency providers that have parameters;
+        # all of them are validated up-front, before any provider is resolved.
+        # sorted stably to keep validation order deterministic
+        self.dependency_signature_models = tuple(
+            sorted(
+                {
+                    signature_model
+                    for batch in self.dependency_batches
+                    for dependency in batch
+                    if (signature_model := dependency.provide.signature_model)._fields
+                },
+                key=lambda model: model.__name__,
+            )
+        )
 
     def _create_extractors(self) -> list[Extractor]:
         reserved_kwargs_extractors: dict[str, Extractor] = {
@@ -478,6 +495,62 @@ class KwargsModel:
                     raise excgroup.exceptions[0] from excgroup  # type: ignore[attr-defined]
 
         return cleanup_group
+
+    def validate_kwargs(
+        self,
+        connection: ASGIConnection,
+        kwargs: dict[str, Any],
+        handler_signature_model: type[SignatureModel],
+    ) -> None:
+        """Validate all client-provided inputs before any side effect occurs.
+
+        The inputs of the handler and all its dependency providers are
+        validated. Dependencies themselves are only resolved - and the
+        handler / background tasks only execute - if this succeeds.
+
+        Args:
+            connection: An instance of :class:`Request <litestar.connection.Request>` or
+                :class:`WebSocket <litestar.connection.WebSocket>`.
+            kwargs: The extracted, raw kwargs.
+            handler_signature_model: The handler function's signature model.
+
+        Raises:
+            ValidationException: If any client-provided input failed validation.
+            InternalServerException: If an injected dependency value failed validation.
+        """
+        messages: list[ErrorMessage] = []
+        causes: list[BaseException] = []
+
+        for signature_model in self.dependency_signature_models:
+            model_messages, model_causes = signature_model.get_validation_errors(
+                connection=connection,
+                kwargs=kwargs,
+                skip_di_fields=True,
+            )
+            messages.extend(model_messages)
+            causes.extend(model_causes)
+
+        model_messages, model_causes = handler_signature_model.get_validation_errors(
+            connection=connection,
+            kwargs=kwargs,
+            skip_di_fields=True,
+        )
+        messages.extend(model_messages)
+        causes.extend(model_causes)
+
+        # de-duplicate identical errors: multiple providers may share an input field
+        unique_messages: list[ErrorMessage] = []
+        seen: set[tuple[tuple[str, str], ...]] = set()
+        for message in messages:
+            marker = tuple(sorted((key, str(value)) for key, value in message.items()))
+            if marker not in seen:
+                seen.add(marker)
+                unique_messages.append(message)
+
+        if unique_messages:
+            raise handler_signature_model._create_exception(
+                connection=connection, messages=unique_messages
+            ) from (causes[-1] if causes else None)
 
     @classmethod
     def _create_dependency_graph(cls, key: str, dependencies: dict[str, Provide]) -> DependencyContainer:

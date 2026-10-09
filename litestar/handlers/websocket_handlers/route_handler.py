@@ -148,6 +148,13 @@ class WebsocketRouteHandler(BaseRouteHandler):
         if handler_kwargs_model.has_kwargs:
             parsed_kwargs = await handler_kwargs_model.to_kwargs(connection=connection)
 
+            # validate every client-provided input before any dependency is resolved
+            handler_kwargs_model.validate_kwargs(
+                connection=connection,
+                kwargs=parsed_kwargs,
+                handler_signature_model=self.signature_model,
+            )
+
             if handler_kwargs_model.dependency_batches:
                 cleanup_group = await handler_kwargs_model.resolve_dependencies(connection, parsed_kwargs)
 
