@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from litestar.types import Empty
+from litestar.utils.scope.state import ScopeState
+
 __all__ = ("DependencyContainer", "create_dependency_batches", "map_dependencies_recursively", "resolve_dependency")
 
 
@@ -55,21 +58,42 @@ async def resolve_dependency(
         cleanup_group: DependencyCleanupGroup to which generators returned by ``dependency`` will be added
     """
     signature_model = dependency.provide.signature_model
+    provide = dependency.provide
+
+    scope_state = ScopeState.from_scope(connection.scope)
+    if provide.use_cache:
+        # dependencies are memoized per connection, never across connections / requests
+        dependency_cache = scope_state.dependency_cache
+        if dependency_cache is not Empty and dependency.key in dependency_cache:
+            kwargs[dependency.key] = dependency_cache[dependency.key]
+            return
+
     dependency_kwargs = (
         signature_model.parse_values_from_connection_kwargs(connection=connection, kwargs=kwargs)
         if signature_model._fields
         else {}
     )
-    value = await dependency.provide(**dependency_kwargs)
+    value = await provide(**dependency_kwargs)
 
-    if dependency.provide.has_sync_generator_dependency:
-        cleanup_group.add(value)
+    generator: Any = None
+    if provide.has_sync_generator_dependency:
+        generator = value
         value = next(value)
-    elif dependency.provide.has_async_generator_dependency:
-        cleanup_group.add(value)
+    elif provide.has_async_generator_dependency:
+        generator = value
         value = await anext(value)
 
+    if generator is not None:
+        # only register the resource for cleanup once it has been successfully established, so dependencies
+        # that failed (or never started) during establishment are not torn down
+        cleanup_group.add(generator)
+
     kwargs[dependency.key] = value
+
+    if provide.use_cache:
+        if scope_state.dependency_cache is Empty:
+            scope_state.dependency_cache = {}
+        scope_state.dependency_cache[dependency.key] = value
 
 
 def create_dependency_batches(expected_dependencies: set[DependencyContainer]) -> list[set[DependencyContainer]]:

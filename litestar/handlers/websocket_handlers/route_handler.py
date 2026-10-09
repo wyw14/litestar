@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import contextlib
 from typing import TYPE_CHECKING, Any
 
 from litestar.connection import WebSocket
-from litestar.exceptions import ImproperlyConfiguredException
+from litestar.exceptions import ImproperlyConfiguredException, WebSocketException
 from litestar.handlers import BaseRouteHandler
+from litestar.status_codes import WS_1011_INTERNAL_ERROR
 from litestar.types import AsyncAnyCallable, Empty, ParametersMap
 from litestar.types.builtin_types import NoneType
 from litestar.utils import deprecated
@@ -15,7 +17,6 @@ if TYPE_CHECKING:
 
     from litestar import Litestar, Router
     from litestar._kwargs import KwargsModel
-    from litestar._kwargs.cleanup import DependencyCleanupGroup
     from litestar.routes import BaseRoute
     from litestar.types import Dependencies, EmptyType, ExceptionHandler, Guard, Middleware
 
@@ -128,6 +129,11 @@ class WebsocketRouteHandler(BaseRouteHandler):
     async def handle(self, connection: WebSocket[Any, Any, Any]) -> None:
         """ASGI app that creates a WebSocket from the passed in args, and then awaits the handler function.
 
+        Resources created by dependencies are kept alive until the handler returns (i.e. until the connection is
+        closed after a successful upgrade). If the upgrade is rejected before that - by guards, failing dependency
+        resolution or any other pre-upgrade failure - every resource established so far is cleaned up in reverse
+        order; resources that were never established are not touched.
+
         Args:
             connection: WebSocket connection
 
@@ -139,26 +145,36 @@ class WebsocketRouteHandler(BaseRouteHandler):
         if handler_kwargs_model is Empty:
             raise ImproperlyConfiguredException("handler parameter model not defined")
 
-        if self.guards:
-            await self.authorize_connection(connection=connection)
-
         parsed_kwargs: dict[str, Any] = {}
-        cleanup_group: DependencyCleanupGroup | None = None
+        # the exit stack owns the established resources and guarantees their teardown whenever the handler
+        # exits, whether the upgrade was rejected, a dependency failed, the client disconnected or the
+        # connection was closed normally after a successful upgrade
+        async with contextlib.AsyncExitStack() as exit_stack:
+            if self.guards:
+                await self.authorize_connection(connection=connection)
 
-        if handler_kwargs_model.has_kwargs:
-            parsed_kwargs = await handler_kwargs_model.to_kwargs(connection=connection)
+            if handler_kwargs_model.has_kwargs:
+                parsed_kwargs = await handler_kwargs_model.to_kwargs(connection=connection)
 
-            if handler_kwargs_model.dependency_batches:
-                cleanup_group = await handler_kwargs_model.resolve_dependencies(connection, parsed_kwargs)
+                if handler_kwargs_model.dependency_batches:
+                    try:
+                        cleanup_group = await handler_kwargs_model.resolve_dependencies(connection, parsed_kwargs)
+                    except WebSocketException:
+                        # already a websocket specific failure (e.g. a disconnect while resolving dependencies)
+                        raise
+                    except Exception as exc:
+                        # report dependency resolution failures distinctly from handshake timeouts and client
+                        # disconnects, so the upgrade can be rejected with a dedicated close response
+                        raise WebSocketException(
+                            detail=f"Failed to resolve websocket handler dependencies: {exc}",
+                            code=WS_1011_INTERNAL_ERROR,
+                        ) from exc
+                    await exit_stack.enter_async_context(cleanup_group)
 
-            parsed_kwargs = self.signature_model.parse_values_from_connection_kwargs(
-                connection=connection, kwargs=parsed_kwargs
-            )
+                parsed_kwargs = self.signature_model.parse_values_from_connection_kwargs(
+                    connection=connection, kwargs=parsed_kwargs
+                )
 
-        if cleanup_group:
-            async with cleanup_group:
-                await self.fn(**parsed_kwargs)
-        else:
             await self.fn(**parsed_kwargs)
 
 

@@ -460,22 +460,32 @@ class KwargsModel:
     async def resolve_dependencies(self, connection: ASGIConnection, kwargs: dict[str, Any]) -> DependencyCleanupGroup:
         """Resolve all dependencies into the kwargs, recursively.
 
+        If resolving a dependency fails, every dependency that was already established (in particular, generator
+        based dependencies) is cleaned up in reverse order, while dependencies that were never established are not
+        touched.
+
         Args:
             connection: An instance of :class:`Request <litestar.connection.Request>` or
                 :class:`WebSocket <litestar.connection.WebSocket>`.
             kwargs: Kwargs to pass to dependencies.
         """
         cleanup_group = DependencyCleanupGroup()
-        for batch in self.dependency_batches:
-            if len(batch) == 1:
-                await resolve_dependency(next(iter(batch)), connection, kwargs, cleanup_group)
-            else:
-                try:
-                    async with create_task_group() as task_group:
-                        for dependency in batch:
-                            task_group.start_soon(resolve_dependency, dependency, connection, kwargs, cleanup_group)
-                except _ExceptionGroup as excgroup:
-                    raise excgroup.exceptions[0] from excgroup  # type: ignore[attr-defined]
+        try:
+            for batch in self.dependency_batches:
+                if len(batch) == 1:
+                    await resolve_dependency(next(iter(batch)), connection, kwargs, cleanup_group)
+                else:
+                    try:
+                        async with create_task_group() as task_group:
+                            for dependency in batch:
+                                task_group.start_soon(resolve_dependency, dependency, connection, kwargs, cleanup_group)
+                    except _ExceptionGroup as excgroup:
+                        raise excgroup.exceptions[0] from excgroup  # type: ignore[attr-defined]
+        except BaseException as exc:
+            # tear down every resource established so far (reverse order) instead of leaking it; the failing
+            # exception is thrown into the generators, mirroring the normal context-manager teardown
+            await cleanup_group.close(exc)
+            raise
 
         return cleanup_group
 

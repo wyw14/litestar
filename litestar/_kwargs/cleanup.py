@@ -4,8 +4,6 @@ from contextlib import AbstractAsyncContextManager
 from inspect import isasyncgen
 from typing import TYPE_CHECKING, Any
 
-from anyio import create_task_group
-
 from litestar.utils import ensure_async_callable
 
 __all__ = ("DependencyCleanupGroup",)
@@ -77,22 +75,30 @@ class DependencyCleanupGroup(AbstractAsyncContextManager):
     async def _cleanup(self) -> None:
         """Execute cleanup by calling :func:`next` / :func:`anext` on all generators.
 
-        If there are multiple generators to be called, they will be executed in a :class:`anyio.TaskGroup`.
+        Generators are cleaned up sequentially in reverse order of their creation, i.e. the most recently
+        established resource is torn down first (LIFO), mirroring nested context manager semantics. If a generator
+        raises during cleanup, the remaining generators are still cleaned up and all cleanup errors are raised
+        together as an :class:`ExceptionGroup`.
 
         Returns:
             None
         """
 
-        if not self._generators:
-            return
+        exceptions: list[BaseException] = []
+        for generator in reversed(self._generators):
+            try:
+                await self._wrap_next(generator)()
+            except BaseException as cleanup_exc:
+                if not isinstance(cleanup_exc, Exception):
+                    # cancellation / system level exceptions must propagate immediately
+                    raise
+                exceptions.append(cleanup_exc)
 
-        if len(self._generators) == 1:
-            await self._wrap_next(self._generators[0])()
-            return
-
-        async with create_task_group() as task_group:
-            for generator in reversed(self._generators):
-                task_group.start_soon(self._wrap_next(generator))
+        if exceptions:
+            raise ExceptionGroup(
+                "Exceptions occurred during cleanup of dependencies",
+                exceptions,
+            )
 
     async def __aenter__(self) -> None:
         """Support the async contextmanager protocol to allow for easier catching and throwing of exceptions into the
@@ -109,13 +115,16 @@ class DependencyCleanupGroup(AbstractAsyncContextManager):
         await self.close(exc_val)
 
     async def _throw(self, exc: BaseException) -> None:
-        """Throw an exception in all generators sequentially.
+        """Throw an exception in all generators sequentially in reverse order of their creation.
+
+        This mirrors the teardown order of nested context managers: the most recently established resource is
+        torn down first.
 
         Args:
             exc: Exception to throw
         """
-        exceptions = []
-        for gen in self._generators:
+        exceptions: list[BaseException] = []
+        for gen in reversed(self._generators):
             try:
                 if isasyncgen(gen):
                     await gen.athrow(exc)
@@ -123,9 +132,16 @@ class DependencyCleanupGroup(AbstractAsyncContextManager):
                     gen.throw(exc)  # type: ignore[union-attr]
             except (StopIteration, StopAsyncIteration):
                 continue
-            except Exception as cleanup_exc:  # noqa: BLE001
-                if cleanup_exc is not exc:
-                    exceptions.append(cleanup_exc)
+            except BaseException as cleanup_exc:
+                # a generator re-raising the exception thrown into it has cleaned itself up; continue with the
+                # remaining generators so every established resource is torn down, even under cancellation
+                if cleanup_exc is exc:
+                    continue
+                if not isinstance(cleanup_exc, Exception):
+                    # non-recoverable BaseException (KeyboardInterrupt, SystemExit, a new CancelledError, ...):
+                    # it must not be swallowed or wrapped in an ExceptionGroup
+                    raise
+                exceptions.append(cleanup_exc)
 
         if exceptions:
             raise ExceptionGroup(

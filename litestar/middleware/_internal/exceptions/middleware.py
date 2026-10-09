@@ -4,7 +4,7 @@ from inspect import getmro
 from typing import TYPE_CHECKING, Any, cast
 
 from litestar.enums import ScopeType
-from litestar.exceptions import HTTPException, LitestarException, WebSocketException
+from litestar.exceptions import HTTPException, LitestarException, WebSocketDisconnect, WebSocketException
 from litestar.exceptions.responses import create_exception_response
 from litestar.exceptions.responses._debug_response import (
     create_debug_response,
@@ -149,7 +149,7 @@ class ExceptionHandlerMiddleware:
                     litestar_app=litestar_app, scope=scope, receive=receive, send=send, exc=exc
                 )
             else:
-                await self.handle_websocket_exception(send=send, exc=exc)
+                await self.handle_websocket_exception(scope_state=scope_state, send=send, exc=exc)
 
     async def handle_request_exception(
         self, litestar_app: Litestar, scope: Scope, receive: Receive, send: Send, exc: Exception
@@ -184,16 +184,30 @@ class ExceptionHandlerMiddleware:
         )
 
     @staticmethod
-    async def handle_websocket_exception(send: Send, exc: Exception) -> None:
+    async def handle_websocket_exception(scope_state: ScopeState, send: Send, exc: Exception) -> None:
         """Handle exception raised inside 'websocket' scope routes.
 
+        The handshake rejection (``websocket.close``) is sent exactly once: it is skipped when the client already
+        disconnected (there is no connection left to reject, as is the case with
+        :class:`WebSocketDisconnect <litestar.exceptions.WebSocketDisconnect>`) or when a terminal close message has
+        already been sent.
+
         Args:
+            scope_state: The connection scoped state.
             send: The ASGI send function.
             exc: The caught exception.
 
         Returns:
             None.
         """
+        if isinstance(exc, WebSocketDisconnect):
+            # the client disconnected, e.g. during the handshake - no rejection response can be delivered
+            return
+
+        if scope_state.websocket_closed:
+            # a terminal close message was already sent, the rejection must not be sent twice
+            return
+
         if isinstance(exc, WebSocketException):
             code = exc.code
             reason = exc.detail
@@ -203,6 +217,9 @@ class ExceptionHandlerMiddleware:
         else:
             raise exc
 
+        # mark the rejection as sent on the shared scope state before sending, so other layers cannot send it
+        # a second time
+        scope_state.websocket_closed = True
         event: WebSocketCloseEvent = {"type": "websocket.close", "code": code, "reason": reason}
         await send(event)
 

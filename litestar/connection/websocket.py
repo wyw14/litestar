@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Generic, Literal, cast, overload
+
+import anyio
 
 from litestar.connection.base import (
     ASGIConnection,
@@ -11,9 +14,9 @@ from litestar.connection.base import (
     empty_send,
 )
 from litestar.datastructures.headers import Headers
-from litestar.exceptions import WebSocketDisconnect
+from litestar.exceptions import WebSocketDisconnect, WebSocketHandshakeTimeout
 from litestar.serialization import decode_json, decode_msgpack, default_serializer, encode_json, encode_msgpack
-from litestar.status_codes import WS_1000_NORMAL_CLOSURE
+from litestar.status_codes import WS_1000_NORMAL_CLOSURE, WS_1001_GOING_AWAY
 
 __all__ = ("WebSocket",)
 
@@ -87,7 +90,11 @@ class WebSocket(Generic[UserT, AuthT, StateT], ASGIConnection["WebsocketRouteHan
         return wrapped_receive
 
     def send_wrapper(self, send: Send) -> Send:
-        """Wrap ``send`` to ensure that state is not disconnected.
+        """Wrap ``send`` to enforce the websocket handshake state machine.
+
+        The wrapper guarantees that a terminal response (``websocket.accept`` or ``websocket.close``) is sent at most
+        once, e.g. a rejection triggered by an exception is not sent a second time after the handler has already
+        closed the connection.
 
         Args:
             send: The ASGI send function.
@@ -97,8 +104,20 @@ class WebSocket(Generic[UserT, AuthT, StateT], ASGIConnection["WebsocketRouteHan
         """
 
         async def wrapped_send(message: Message) -> None:
-            if self.connection_state == "disconnect":
-                raise WebSocketDisconnect(detail=DISCONNECT_MESSAGE)  # pragma: no cover
+            scope_state = self._connection_state
+            message_type = message["type"]
+            if message_type == "websocket.close":
+                # the rejection / closing response is terminal and must only be sent once
+                if scope_state.websocket_closed:
+                    return
+                scope_state.websocket_closed = True
+            elif message_type == "websocket.accept":
+                if scope_state.websocket_closed:
+                    # the upgrade was already rejected, so it can no longer be accepted
+                    raise WebSocketDisconnect(detail=DISCONNECT_MESSAGE)
+                scope_state.websocket_accepted = True
+            elif self.connection_state == "disconnect" or scope_state.websocket_closed:
+                raise WebSocketDisconnect(detail=DISCONNECT_MESSAGE)
             await send(message)
 
         return wrapped_send
@@ -107,32 +126,68 @@ class WebSocket(Generic[UserT, AuthT, StateT], ASGIConnection["WebsocketRouteHan
         self,
         subprotocols: str | None = None,
         headers: Headers | dict[str, Any] | list[tuple[bytes, bytes]] | None = None,
+        timeout: float | None = None,
     ) -> None:
         """Accept the incoming connection. This method should be called before receiving data.
 
         Args:
             subprotocols: Websocket sub-protocol to use.
             headers: Headers to set on the data sent.
+            timeout: Optional timeout in seconds to wait for the incoming ``websocket.connect`` event. If the client
+                does not complete the opening handshake within this time, a
+                :class:`WebSocketHandshakeTimeout <litestar.exceptions.WebSocketHandshakeTimeout>` is raised and the
+                upgrade is not accepted. ``None`` (the default) waits indefinitely.
+
+        Raises:
+            WebSocketHandshakeTimeout: If ``timeout`` is given and the handshake was not completed in time.
+            WebSocketDisconnect: If the client disconnects before the handshake is completed.
 
         Returns:
             None
         """
         if self.connection_state == "init":
-            await self.receive()
-            _headers: list[tuple[bytes, bytes]] = headers if isinstance(headers, list) else []
+            await self._receive_connect_event(timeout=timeout)
+        _headers: list[tuple[bytes, bytes]] = headers if isinstance(headers, list) else []
 
-            if isinstance(headers, dict):
-                _headers = Headers(headers=headers).to_header_list()
+        if isinstance(headers, dict):
+            _headers = Headers(headers=headers).to_header_list()
 
-            if isinstance(headers, Headers):
-                _headers = headers.to_header_list()
+        if isinstance(headers, Headers):
+            _headers = headers.to_header_list()
 
-            event: WebSocketAcceptEvent = {
-                "type": "websocket.accept",
-                "subprotocol": subprotocols,
-                "headers": _headers,
-            }
-            await self.send(event)
+        event: WebSocketAcceptEvent = {
+            "type": "websocket.accept",
+            "subprotocol": subprotocols,
+            "headers": _headers,
+        }
+        await self.send(event)
+
+    async def _receive_connect_event(self, timeout: float | None = None) -> ReceiveMessage:
+        """Wait for the initial ``websocket.connect`` event, distinguishing a client disconnect and a handshake
+        timeout from a successful handshake.
+
+        Args:
+            timeout: Maximum time in seconds to wait for the event, or ``None`` to wait indefinitely.
+
+        Raises:
+            WebSocketHandshakeTimeout: If the event is not received within ``timeout`` seconds.
+            WebSocketDisconnect: If the client disconnects before sending the connect event.
+
+        Returns:
+            The received ``websocket.connect`` event.
+        """
+        timeout_scope = nullcontext() if timeout is None else anyio.fail_after(timeout)
+        try:
+            with timeout_scope:
+                event = await self.receive()
+        except TimeoutError as exc:
+            raise WebSocketHandshakeTimeout() from exc
+        if event["type"] == "websocket.disconnect":
+            raise WebSocketDisconnect(
+                detail="client disconnected before the websocket handshake was completed",
+                code=event.get("code") or WS_1001_GOING_AWAY,
+            )
+        return event
 
     async def close(self, code: int = WS_1000_NORMAL_CLOSURE, reason: str | None = None) -> None:
         """Send an 'websocket.close' event.

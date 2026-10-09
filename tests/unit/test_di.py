@@ -6,7 +6,6 @@ import pytest
 
 from litestar.di import Provide
 from litestar.exceptions import ImproperlyConfiguredException, LitestarWarning
-from litestar.types import Empty
 
 
 def generator_func() -> Generator[float, None, None]:
@@ -94,16 +93,21 @@ async def test_provide_default(anyio_backend: str) -> None:
     assert value == "three-one"
 
 
-async def test_provide_cached(anyio_backend: str) -> None:
-    provider = Provide(dependency=async_callable, use_cache=True)
-    assert provider.value is Empty
-    value = await provider()
-    assert value == "three-one"
-    assert provider.value == value
-    second_value = await provider()
-    assert value == second_value
-    third_value = await provider()
-    assert value == third_value
+async def test_provide_cached_does_not_memoize_across_direct_calls(anyio_backend: str) -> None:
+    # ``use_cache`` memoizes the dependency value per request / connection during dependency resolution.
+    # Calling a provider directly must not share values between invocations, as that would leak values from one
+    # request (e.g. one websocket handshake) into another.
+    calls = 0
+
+    async def callable_with_calls() -> int:
+        nonlocal calls
+        calls += 1
+        return calls
+
+    provider = Provide(dependency=callable_with_calls, use_cache=True)
+    assert await provider() == 1
+    assert await provider() == 2
+    assert calls == 2
 
 
 async def test_run_in_thread(anyio_backend: str) -> None:
@@ -118,8 +122,6 @@ def test_provider_equality_check() -> None:
     assert first_provider == second_provider
     third_provider = Provide(dependency=sync_callable, use_cache=True, sync_to_thread=False)
     assert first_provider != third_provider
-    second_provider.value = True
-    assert first_provider != second_provider
 
 
 @pytest.mark.parametrize(

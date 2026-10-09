@@ -47,6 +47,8 @@ class ScopeState:
         "response_started",
         "session_id",
         "url",
+        "websocket_accepted",
+        "websocket_closed",
     )
 
     def __init__(self) -> None:
@@ -71,6 +73,8 @@ class ScopeState:
         self.response_started = False
         self.session_id = Empty
         self.url = Empty
+        self.websocket_accepted = False
+        self.websocket_closed = False
 
     accept: Accept | EmptyType
     base_url: URL | EmptyType
@@ -93,6 +97,8 @@ class ScopeState:
     response_started: bool
     session_id: str | None | EmptyType
     url: URL | EmptyType
+    websocket_accepted: bool
+    websocket_closed: bool
 
     @classmethod
     def from_scope(cls, scope: Scope) -> Self:

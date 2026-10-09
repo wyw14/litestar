@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal, TypeAlias, TypeVar
 
 from litestar.exceptions import ImproperlyConfiguredException
 from litestar.plugins import DIPlugin, PluginRegistry
-from litestar.types import Empty, TypeDecodersSequence
 from litestar.utils import ensure_async_callable
 from litestar.utils.helpers import unwrap_partial
 from litestar.utils.predicates import is_async_callable
@@ -21,7 +20,7 @@ from litestar.utils.warnings import (
 if TYPE_CHECKING:
     from litestar._signature import SignatureModel
     from litestar.dto import AbstractDTO
-    from litestar.types import AnyCallable
+    from litestar.types import AnyCallable, TypeDecodersSequence
 
 
 __all__ = (
@@ -60,7 +59,6 @@ class Provide:
         "has_sync_generator_dependency",
         "sync_to_thread",
         "use_cache",
-        "value",
     )
 
     dependency: AnyCallable
@@ -75,7 +73,8 @@ class Provide:
 
         Args:
             dependency: Callable to call or class to instantiate. The result is then injected as a dependency.
-            use_cache: Cache the dependency return value. Defaults to False.
+            use_cache: Memoize the dependency return value for the duration of a single request / connection.
+                Defaults to False. The value is never reused across different requests or connections.
             sync_to_thread: Run sync code in an async thread. Defaults to False.
         """
         if not callable(dependency):
@@ -116,7 +115,6 @@ class Provide:
 
         self.sync_to_thread = bool(sync_to_thread)
         self.use_cache = use_cache
-        self.value: Any = Empty
         self._parsed_fn_signature: ParsedSignature | None = None
         self._signature_model: type[SignatureModel] | None = None
 
@@ -165,20 +163,17 @@ class Provide:
             )
 
     async def __call__(self, **kwargs: Any) -> Any:
-        """Call the provider's dependency."""
+        """Call the provider's dependency.
 
-        if self.use_cache and self.value is not Empty:
-            return self.value
+        Note:
+            ``use_cache`` memoization is scoped to a single request / connection and is handled during dependency
+            resolution. Calling a provider directly always invokes the underlying dependency; values are never
+            shared across requests.
+        """
 
         if self.has_sync_callable:
-            value = self.dependency(**kwargs)
-        else:
-            value = await self.dependency(**kwargs)
-
-        if self.use_cache:
-            self.value = value
-
-        return value
+            return self.dependency(**kwargs)
+        return await self.dependency(**kwargs)
 
     def __eq__(self, other: Any) -> bool:
         # check if memory address is identical, otherwise compare attributes
@@ -186,5 +181,4 @@ class Provide:
             isinstance(other, self.__class__)
             and other.dependency == self.dependency
             and other.use_cache == self.use_cache
-            and other.value == self.value
         )

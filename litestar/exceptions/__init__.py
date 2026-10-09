@@ -21,7 +21,7 @@ from .http_exceptions import (
     TooManyRequestsException,
     ValidationException,
 )
-from .websocket_exceptions import WebSocketDisconnect, WebSocketException
+from .websocket_exceptions import WebSocketDisconnect, WebSocketException, WebSocketHandshakeTimeout
 
 __all__ = (
     "ClientException",
@@ -46,4 +46,5 @@ __all__ = (
     "ValidationException",
     "WebSocketDisconnect",
     "WebSocketException",
+    "WebSocketHandshakeTimeout",
 )
